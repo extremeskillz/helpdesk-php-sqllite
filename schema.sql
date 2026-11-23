@@ -1,0 +1,23 @@
+CREATE TABLE roles(id INTEGER PRIMARY KEY, name TEXT UNIQUE NOT NULL);
+INSERT INTO roles(id,name) VALUES(1,'admin'),(2,'tech'),(3,'supervisor'),(4,'user');
+CREATE TABLE users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,email TEXT UNIQUE NOT NULL,password_hash TEXT NOT NULL,role_id INTEGER NOT NULL REFERENCES roles(id),active INTEGER NOT NULL DEFAULT 1,created_at TEXT NOT NULL,last_login TEXT,phone TEXT,company TEXT,department TEXT,email_verified_at TEXT,otp_verified_at TEXT,last_activity_at TEXT);
+CREATE TABLE groups(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,description TEXT DEFAULT '');
+CREATE TABLE group_members(group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,PRIMARY KEY(group_id,user_id));
+CREATE TABLE user_roles(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,PRIMARY KEY(user_id,role_id));
+CREATE TABLE permissions(id INTEGER PRIMARY KEY AUTOINCREMENT,permission_key TEXT NOT NULL UNIQUE,description TEXT NOT NULL DEFAULT '');
+CREATE TABLE role_permissions(role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,permission_id INTEGER NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,PRIMARY KEY(role_id,permission_id));
+CREATE TABLE group_roles(group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,PRIMARY KEY(group_id,role_id));
+CREATE TABLE user_groups(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,PRIMARY KEY(user_id,group_id));
+CREATE TABLE categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,active INTEGER NOT NULL DEFAULT 1);
+INSERT INTO categories(name) VALUES('Hardware'),('Software'),('Network'),('Accounts & access'),('Other');
+CREATE TABLE statuses(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL); INSERT INTO statuses(name) VALUES('Open'),('In Progress'),('Waiting on User'),('Resolved'),('Closed');
+CREATE TABLE priorities(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,level INTEGER NOT NULL); INSERT INTO priorities(name,level) VALUES('Low',1),('Normal',2),('High',3),('Critical',4);
+CREATE TABLE tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_no TEXT UNIQUE NOT NULL,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,subject TEXT NOT NULL,description TEXT NOT NULL,category_id INTEGER REFERENCES categories(id),priority_id INTEGER NOT NULL REFERENCES priorities(id),status_id INTEGER NOT NULL REFERENCES statuses(id),group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,assigned_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,resolved_at TEXT,guest_name TEXT,guest_email TEXT,guest_phone TEXT,guest_company TEXT,guest_department TEXT);
+CREATE TABLE ticket_comments(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,body TEXT NOT NULL,is_internal INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+CREATE TABLE ticket_attachments(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,comment_id INTEGER REFERENCES ticket_comments(id) ON DELETE CASCADE,original_name TEXT NOT NULL,stored_name TEXT NOT NULL,mime_type TEXT NOT NULL,size INTEGER NOT NULL,uploaded_by INTEGER REFERENCES users(id),created_at TEXT NOT NULL);
+CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE email_log(id INTEGER PRIMARY KEY AUTOINCREMENT,recipient TEXT NOT NULL,subject TEXT NOT NULL,success INTEGER NOT NULL,created_at TEXT NOT NULL);
+CREATE TABLE audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,action TEXT NOT NULL,details TEXT,ip TEXT,created_at TEXT NOT NULL);
+CREATE INDEX idx_tickets_status ON tickets(status_id); CREATE INDEX idx_tickets_user ON tickets(user_id); CREATE INDEX idx_tickets_updated ON tickets(updated_at);
+
+CREATE INDEX idx_user_roles_role ON user_roles(role_id);
