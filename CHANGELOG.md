@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.4.0
+### Security
+- Database and private folders are now protected: new `storage/.htaccess` and `app/.htaccess`, and the root `.htaccess` also denies `*.sqlite`, `-wal`, `-shm`, migration lock files, `VERSION` and `*.md`. Settings shows a red warning if the database file is reachable from the browser. Nginx rules are documented.
+- Sign-in throttling: failed sign-ins lock an email address (default 5 failures) and a client IP (4× that) for a configurable window (default 15 minutes). Unknown accounts take the same time as wrong passwords. Verification-code emails are limited to 5 per address per hour.
+- Privilege escalation fixed: non-administrators can no longer edit or delete administrator accounts (or any account holding permissions they lack), assign roles carrying permissions they lack, or grant permissions they do not hold when editing roles and group roles.
+- Email links no longer trust a forged `Host` header: the host is validated, `base_url` is requested during setup, and Settings warns when it is empty. Added optional `trusted_proxy_header` for correct client IPs behind a proxy.
+- Email-template HTML is now sanitised with a DOM allow-list (tags, attributes, URL schemes and CSS properties) instead of regular expressions.
+- Logout is now a CSRF-protected POST; added `X-Content-Type-Options`, `X-Frame-Options` and `Referrer-Policy` headers; attachment downloads send `nosniff` and a proper UTF-8 `filename*`.
+
+### Fixes
+- Setup creates `storage/` and `uploads/`, checks PHP version and `pdo_sqlite`, and writes `config.php` last; a failed install cleans up and can be retried.
+- Schema migration is versioned (`schema_version`), locked against concurrent runs, and runs once instead of on every request. Removing permissions from built-in roles is no longer silently undone; the System Administrator role always keeps the full permission catalog.
+- Permission checks use one cached query per user instead of several, speeding up pages that list users.
+- Fixed "Assignment changed" being logged on every save of an unassigned ticket; fixed dashboard date filters disagreeing with reports around midnight; removed a hard-coded old version string from error logs.
+- `schema.sql` now matches a migrated database (ticket history, OTP, rate-limit tables, status `active` flag).
+
+### Changes
+- Replaced TinyMCE with **Jodit** (MIT licence) for email templates, with placeholder-insert buttons, dark-theme support, optional self-hosting from `public/vendor/jodit/`, and a plain-textarea fallback.
+- The system logo and name now appear on the sign-in, registration, verification and guest-ticket screens, and the logo is the browser tab icon.
+- New Settings → Security options for sign-in lockout; Settings → System information shows the schema version and `base_url` status.
+- README, INSTALL and CHANGELOG updated, including upgrade steps from v1.3.0.
+
 ## 1.3.0
 - Reworked authorization around additive direct-user and group role assignments.
 - Added a granular permission catalog for ticket actions, users, groups, roles, settings, reports, categories, and statuses.

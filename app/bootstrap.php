@@ -4,11 +4,13 @@ $configFile = dirname(__DIR__) . '/config.php';
 if (!is_file($configFile)) { http_response_code(503); exit('HelpDesk is not installed. Run /setup.php first.'); }
 $config = require $configFile;
 date_default_timezone_set($config['timezone'] ?? 'UTC');
+const SCHEMA_VERSION = 14;
+if (!headers_sent()) { header('X-Content-Type-Options: nosniff'); header('X-Frame-Options: SAMEORIGIN'); header('Referrer-Policy: same-origin'); }
 session_name($config['session_name'] ?? 'helpdesk_session');
 session_set_cookie_params(['httponly'=>true,'secure'=>(!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off'),'samesite'=>'Lax']);
 session_start();
 
-function migrate_v12(PDO $pdo): void {
+function run_migrations(PDO $pdo, int $from=0): void {
     $cols=$pdo->query("PRAGMA table_info(tickets)")->fetchAll(PDO::FETCH_ASSOC); $names=array_column($cols,'name');
     foreach(['guest_name'=>'TEXT','guest_email'=>'TEXT','guest_phone'=>'TEXT','guest_company'=>'TEXT','guest_department'=>'TEXT'] as $col=>$type) if(!in_array($col,$names,true)) $pdo->exec("ALTER TABLE tickets ADD COLUMN $col $type");
     $statusCols=$pdo->query("PRAGMA table_info(statuses)")->fetchAll(PDO::FETCH_ASSOC); $statusNames=array_column($statusCols,'name');
@@ -78,10 +80,29 @@ function migrate_v12(PDO $pdo): void {
     ];
     $count=(int)$pdo->query('SELECT COUNT(*) FROM role_permissions')->fetchColumn();
     if($count===0){$roles=$pdo->query('SELECT id,name FROM roles')->fetchAll(PDO::FETCH_ASSOC);foreach($roles as $role){foreach(($legacyMaps[$role['name']]??[]) as $key){$q=$pdo->prepare('INSERT OR IGNORE INTO role_permissions(role_id,permission_id) SELECT ?,id FROM permissions WHERE permission_key=?');$q->execute([$role['id'],$key]);}}}
-    else { // Add new granular equivalents to legacy roles without removing any custom grants.
+    elseif($from<14) { // One-time upgrade from pre-1.4 installs: add granular equivalents to legacy roles (never re-applied, so admin changes to built-in roles persist).
       foreach($pdo->query('SELECT id,name FROM roles')->fetchAll(PDO::FETCH_ASSOC) as $role){foreach(($legacyMaps[$role['name']]??[]) as $key){$q=$pdo->prepare('INSERT OR IGNORE INTO role_permissions(role_id,permission_id) SELECT ?,id FROM permissions WHERE permission_key=?');$q->execute([$role['id'],$key]);}}
     }
     $pdo->exec('INSERT OR IGNORE INTO user_groups(user_id,group_id) SELECT gm.user_id,gm.group_id FROM group_members gm');
+    // v1.4: rate limiting table; the protected System Administrator role always holds the full permission catalog.
+    $pdo->exec("CREATE TABLE IF NOT EXISTS rate_limits (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, rkey TEXT NOT NULL, created_at INTEGER NOT NULL)");
+    $pdo->exec("CREATE INDEX IF NOT EXISTS idx_rate_limits_lookup ON rate_limits(bucket,rkey,created_at)");
+    $adminRoleId=(int)$pdo->query("SELECT id FROM roles WHERE name='admin'")->fetchColumn();
+    if($adminRoleId>0) $pdo->prepare('INSERT OR IGNORE INTO role_permissions(role_id,permission_id) SELECT ?,id FROM permissions')->execute([$adminRoleId]);
+}
+function schema_version_current(PDO $pdo): int {
+    try { $v=$pdo->query("SELECT value FROM settings WHERE key='schema_version'")->fetchColumn(); return $v===false?0:(int)$v; } catch(Throwable $e) { return 0; }
+}
+function ensure_schema(PDO $pdo, string $dbPath): void {
+    if(schema_version_current($pdo)>=SCHEMA_VERSION) return;
+    $lock=@fopen($dbPath.'.migrate.lock','c'); if($lock) flock($lock,LOCK_EX);
+    try {
+        $from=schema_version_current($pdo);
+        if($from<SCHEMA_VERSION) {
+            run_migrations($pdo,$from);
+            $pdo->prepare('INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)')->execute(['schema_version',(string)SCHEMA_VERSION]);
+        }
+    } finally { if($lock){ flock($lock,LOCK_UN); fclose($lock); } }
 }
 function db(): PDO {
     static $pdo = null; global $config;
@@ -90,8 +111,8 @@ function db(): PDO {
     if (!is_file($path)) throw new RuntimeException('Database missing. Run setup.php.');
     $pdo = new PDO('sqlite:' . $path, null, null, [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
     $pdo->exec('PRAGMA foreign_keys = ON'); $pdo->exec('PRAGMA journal_mode = WAL'); $pdo->exec('PRAGMA busy_timeout = 5000');
-    // Apply repeat-safe v1.2 guest-ticket schema additions on existing installations.
-    migrate_v12($pdo);
+    // Versioned, locked schema migration: runs once per release instead of on every request.
+    ensure_schema($pdo,$path);
     return $pdo;
 }
 function h(?string $s): string { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
@@ -103,6 +124,8 @@ function otp_enabled(): bool { return setting('otp_enabled','0')==='1'; }
 function send_otp(string $email,string $purpose,array $payload=[]): bool {
     $pdo=db(); $now=time(); $q=$pdo->prepare('SELECT created_at FROM otp_challenges WHERE email=? AND purpose=? AND session_hash=? ORDER BY created_at DESC LIMIT 1'); $q->execute([$email,$purpose,hash('sha256',session_id())]); $last=$q->fetchColumn();
     if($last!==false && $now-(int)$last<60) return false;
+    if(rate_limit_count('otp_send',strtolower($email),3600)>=5) return false;
+    rate_limit_hit('otp_send',strtolower($email));
     $pdo->prepare('DELETE FROM otp_challenges WHERE expires_at<? OR (email=? AND purpose=? AND session_hash=?)')->execute([$now,$email,$purpose,hash('sha256',session_id())]);
     $code=(string)random_int(100000,999999); $id=bin2hex(random_bytes(16));
     $pdo->prepare('INSERT INTO otp_challenges(id,email,purpose,code_hash,payload,session_hash,expires_at,attempts,created_at) VALUES(?,?,?,?,?,?,?,?,?)')->execute([$id,$email,$purpose,password_hash($code,PASSWORD_DEFAULT),$payload?json_encode($payload,JSON_THROW_ON_ERROR):null,hash('sha256',session_id()),$now+600,0,$now]);
@@ -125,12 +148,32 @@ function user_role_ids(array $u): array {
     if(!empty($u['role_id'])) $ids[]=(int)$u['role_id'];
     return array_values(array_unique(array_filter($ids)));
 }
+function effective_permissions(array $u): array {
+    $uid=(int)($u['id']??0); if($uid<=0) return [];
+    if(isset($GLOBALS['perm_cache'][$uid])) return $GLOBALS['perm_cache'][$uid];
+    $q=db()->prepare('SELECT DISTINCT p.permission_key FROM permissions p JOIN role_permissions rp ON rp.permission_id=p.id WHERE rp.role_id IN (SELECT role_id FROM user_roles WHERE user_id=:u1 UNION SELECT role_id FROM users WHERE id=:u2 UNION SELECT gr.role_id FROM user_groups ug JOIN group_roles gr ON gr.group_id=ug.group_id WHERE ug.user_id=:u3)');
+    $q->execute([':u1'=>$uid,':u2'=>$uid,':u3'=>$uid]);
+    return $GLOBALS['perm_cache'][$uid]=array_map('strval',$q->fetchAll(PDO::FETCH_COLUMN));
+}
+function clear_permission_cache(): void { $GLOBALS['perm_cache']=[]; }
 function has_permission(string $key,?array $u=null): bool {
     $u=$u??current_user(); if(!$u) return false;
-    $ids=user_role_ids($u); if(!$ids) return false;
-    $marks=implode(',',array_fill(0,count($ids),'?'));
-    $q=db()->prepare("SELECT COUNT(*) FROM role_permissions rp JOIN permissions p ON p.id=rp.permission_id WHERE p.permission_key=? AND rp.role_id IN ($marks)"); $q->execute(array_merge([$key],$ids)); if((int)$q->fetchColumn()>0) return true;
-    $q=db()->prepare('SELECT COUNT(*) FROM user_groups ug JOIN group_roles gr ON gr.group_id=ug.group_id JOIN role_permissions rp ON rp.role_id=gr.role_id JOIN permissions p ON p.id=rp.permission_id WHERE ug.user_id=? AND p.permission_key=?'); $q->execute([(int)$u['id'],$key]); return (int)$q->fetchColumn()>0;
+    return in_array($key,effective_permissions($u),true);
+}
+function role_permission_keys(int $roleId): array { $q=db()->prepare('SELECT p.permission_key FROM role_permissions rp JOIN permissions p ON p.id=rp.permission_id WHERE rp.role_id=?'); $q->execute([$roleId]); return array_map('strval',$q->fetchAll(PDO::FETCH_COLUMN)); }
+/** A non-admin may only assign roles whose permissions they already hold themselves. */
+function actor_can_assign_role(array $actor,int $roleId): bool {
+    if(has_permission('admin.access',$actor)) return true;
+    $mine=effective_permissions($actor); foreach(role_permission_keys($roleId) as $k) if(!in_array($k,$mine,true)) return false;
+    return true;
+}
+/** A non-admin may only modify accounts that hold no permission they lack (never an administrator). */
+function can_manage_user(array $actor,int $targetId): bool {
+    if($targetId<=0 || (int)$actor['id']===$targetId || has_permission('admin.access',$actor)) return true;
+    $q=db()->prepare('SELECT * FROM users WHERE id=?'); $q->execute([$targetId]); $t=$q->fetch(); if(!$t) return false;
+    if(has_permission('admin.access',$t)) return false;
+    $mine=effective_permissions($actor); foreach(effective_permissions($t) as $k) if(!in_array($k,$mine,true)) return false;
+    return true;
 }
 function users_with_permission(string $key): array { $rows=db()->query('SELECT u.*,r.name role_name FROM users u JOIN roles r ON r.id=u.role_id WHERE u.active=1 ORDER BY u.name')->fetchAll(); return array_values(array_filter($rows,fn($row)=>has_permission($key,$row))); }
 function user_has_group(array $u,int $groupId): bool { if($groupId<=0)return false; $q=db()->prepare('SELECT 1 FROM user_groups WHERE user_id=? AND group_id=?');$q->execute([(int)$u['id'],$groupId]);return (bool)$q->fetchColumn(); }
@@ -152,7 +195,7 @@ function verify_csrf(): void { if($_SERVER['REQUEST_METHOD']==='POST' && !hash_e
 function flash(string $msg, string $type='success'): void { $_SESSION['flash']=['message'=>$msg,'type'=>$type]; }
 function get_flash(): ?array { $f=$_SESSION['flash']??null; unset($_SESSION['flash']); return $f; }
 function mail_send(string $to, string $subject, string $html, ?string $replyTo=null): bool {
-    $from=setting('mail_from', 'helpdesk@'.($_SERVER['HTTP_HOST']??'localhost'));
+    $from=setting('mail_from', 'helpdesk@'.preg_replace('/:\d+$/','',request_host()));
     $name=setting('mail_from_name', setting('app_name','HelpDesk'));
     if (!filter_var($to,FILTER_VALIDATE_EMAIL) || !filter_var($from,FILTER_VALIDATE_EMAIL)) return false;
     $encodedSubject='=?UTF-8?B?'.base64_encode($subject).'?=';
@@ -162,14 +205,60 @@ function mail_send(string $to, string $subject, string $html, ?string $replyTo=n
     try { $q=db()->prepare('INSERT INTO email_log(recipient,subject,success,created_at) VALUES(?,?,?,?)'); $q->execute([$to,$subject,$ok?1:0,date('c')]); } catch(Throwable $e) {}
     return $ok;
 }
-function sanitize_email_html(string $html): string {
+function sanitize_email_html_basic(string $html): string {
     $html=preg_replace('#<(script|style|iframe|object|embed|form|input|button|video|audio)[^>]*>.*?</\\1>#is','',$html)??'';
-    $allowed='<p><br><div><span><strong><b><em><i><u><s><ul><ol><li><h1><h2><h3><h4><blockquote><a><img><table><thead><tbody><tr><th><td><hr><pre><code>';
-    $html=strip_tags($html,$allowed);
-    $html=preg_replace('/\\s+on[a-z]+\\s*=\\s*("[^"]*"|\\\'[^\\\']*\\\'|[^\\s>]+)/i','',$html)??$html;
-    $html=preg_replace_callback('/\\s(href|src)\\s*=\\s*(["\\\'])(.*?)\\2/i',function($m){$v=trim(html_entity_decode($m[3],ENT_QUOTES|ENT_HTML5,'UTF-8'));if(preg_match('/^(javascript|data|vbscript):/i',$v))return '';return ' '.$m[1].'='.$m[2].htmlspecialchars($v,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8').$m[2];},$html)??$html;
-    $html=preg_replace_callback('/\\sstyle\\s*=\\s*(["\\\'])(.*?)\\1/i',function($m){$style=preg_replace('/expression\\s*\\(|url\\s*\\(\\s*["\\\']?\\s*(javascript|data):/i','',$m[2])??'';return ' style="'.htmlspecialchars($style,ENT_QUOTES|ENT_SUBSTITUTE,'UTF-8').'"';},$html)??$html;
+    $html=strip_tags($html,'<p><br><div><span><strong><b><em><i><u><s><ul><ol><li><h1><h2><h3><h4><blockquote><a><img><table><thead><tbody><tr><th><td><hr><pre><code>');
+    $html=preg_replace('/\\s+on[a-z]+\\s*=\\s*("[^"]*"|\'[^\']*\'|[^\\s>]+)/i','',$html)??$html;
+    $html=preg_replace('/\\s(href|src|style)\\s*=\\s*("[^"]*(javascript|data|vbscript|expression)[^"]*"|\'[^\']*(javascript|data|vbscript|expression)[^\']*\')/i','',$html)??$html;
     return $html;
+}
+function email_css_safe(string $style): string {
+    $allowed=['color','background','background-color','font','font-family','font-size','font-weight','font-style','text-align','text-decoration','line-height','letter-spacing','margin','margin-top','margin-right','margin-bottom','margin-left','padding','padding-top','padding-right','padding-bottom','padding-left','border','border-top','border-right','border-bottom','border-left','border-color','border-style','border-width','border-radius','border-collapse','width','height','max-width','min-width','vertical-align','list-style-type'];
+    $out=[];
+    foreach(explode(';',$style) as $decl){ $p=strpos($decl,':'); if($p===false) continue; $prop=strtolower(trim(substr($decl,0,$p))); $val=trim(substr($decl,$p+1)); if($prop===''||$val===''||!in_array($prop,$allowed,true)) continue; if(preg_match('/(url\s*\(|expression|javascript:|@import|\\\\|<|>|behavior|binding)/i',$val)) continue; $out[]=$prop.': '.$val; }
+    return implode('; ',$out);
+}
+function email_url_safe(string $v,bool $image=false): bool {
+    $v=html_entity_decode(trim($v),ENT_QUOTES|ENT_HTML5,'UTF-8'); $v=preg_replace('/[\x00-\x20]+/','',$v)??''; if($v==='') return false;
+    if(!preg_match('#^([a-z][a-z0-9+.\-]*):#i',$v,$m)) return false;
+    $scheme=strtolower($m[1]); return $image?in_array($scheme,['http','https','cid'],true):in_array($scheme,['http','https','mailto','tel'],true);
+}
+function sanitize_email_html(string $html): string {
+    if(trim($html)==='') return '';
+    if(!class_exists('DOMDocument')) return sanitize_email_html_basic($html);
+    $tags=['p','br','div','span','strong','b','em','i','u','s','strike','sub','sup','ul','ol','li','h1','h2','h3','h4','h5','h6','blockquote','a','img','table','thead','tbody','tfoot','tr','th','td','caption','colgroup','col','hr','pre','code','small','center'];
+    $dropWithContent=['script','style','iframe','object','embed','form','input','button','select','textarea','video','audio','svg','math','link','meta','base','noscript','template','head','title'];
+    $globalAttrs=['style','align','title'];
+    $tagAttrs=['a'=>['href','target'],'img'=>['src','alt','width','height'],'table'=>['border','cellpadding','cellspacing','width','bgcolor'],'td'=>['colspan','rowspan','width','height','valign','bgcolor'],'th'=>['colspan','rowspan','width','height','valign','bgcolor'],'col'=>['span','width'],'colgroup'=>['span','width']];
+    $numeric=['width','height','border','cellpadding','cellspacing','colspan','rowspan','span'];
+    $prev=libxml_use_internal_errors(true);
+    $doc=new DOMDocument('1.0','UTF-8');
+    $doc->loadHTML('<?xml encoding="UTF-8"><div>'.$html.'</div>',LIBXML_HTML_NOIMPLIED|LIBXML_HTML_NODEFDTD);
+    libxml_clear_errors(); libxml_use_internal_errors($prev);
+    $root=$doc->getElementsByTagName('div')->item(0); if(!$root) return sanitize_email_html_basic($html);
+    $clean=function(DOMNode $node) use (&$clean,$tags,$dropWithContent,$globalAttrs,$tagAttrs,$numeric) {
+        foreach(iterator_to_array($node->childNodes) as $child) {
+            if($child instanceof DOMText) continue;
+            if(!($child instanceof DOMElement)) { $node->removeChild($child); continue; }
+            $tag=strtolower($child->nodeName);
+            if(in_array($tag,$dropWithContent,true)) { $node->removeChild($child); continue; }
+            $clean($child);
+            if(!in_array($tag,$tags,true)) { while($child->firstChild) $node->insertBefore($child->firstChild,$child); $node->removeChild($child); continue; }
+            foreach(iterator_to_array($child->attributes) as $attr) {
+                $name=strtolower($attr->nodeName); $val=(string)$attr->nodeValue;
+                if(!in_array($name,$globalAttrs,true) && !in_array($name,$tagAttrs[$tag]??[],true)) { $child->removeAttribute($attr->nodeName); continue; }
+                if($name==='style') { $css=email_css_safe($val); if($css==='') $child->removeAttribute('style'); else $child->setAttribute('style',$css); }
+                elseif($name==='href' || $name==='src') { if(!email_url_safe($val,$name==='src')) $child->removeAttribute($attr->nodeName); }
+                elseif(in_array($name,$numeric,true)) { if(!preg_match('/^\d{1,4}%?$/',trim($val))) $child->removeAttribute($attr->nodeName); }
+                elseif($name==='bgcolor') { if(!preg_match('/^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)$/',trim($val))) $child->removeAttribute($attr->nodeName); }
+                elseif($name==='target') { if(!in_array(strtolower($val),['_blank','_self'],true)) $child->removeAttribute('target'); }
+            }
+            if($tag==='a' && $child->hasAttribute('target')) $child->setAttribute('rel','noopener noreferrer');
+        }
+    };
+    $clean($root);
+    $out=''; foreach($root->childNodes as $c) $out.=$doc->saveHTML($c);
+    return $out;
 }
 function render_email_template(string $event,array $ticket,string $message=''): array {
     $defaults=[
@@ -187,6 +276,7 @@ function render_email_template(string $event,array $ticket,string $message=''): 
     // Plain-text templates saved by older releases remain readable after upgrade.
     if(strip_tags($body)===$body) $body=nl2br(h($body));
     foreach($values as $key=>$value){$safe=$key==='message'?nl2br(h($value)):h($value);$subject=str_replace('{'.$key.'}',$value,$subject);$body=str_replace('{'.$key.'}',$safe,$body);}
+    foreach(['{{ticket.url}}','%7B%7Bticket.url%7D%7D','{ticket.url}','%7Bticket.url%7D','{ticket_url}','%7Bticket_url%7D'] as $token){ $body=preg_replace_callback('/(href\s*=\s*["\'])\s*'.preg_quote($token,'/').'\s*(["\'])/i',fn($m)=>$m[1].h($ticketUrl).$m[2],$body)??$body; }
     $link='<a href="'.h($ticketUrl).'" target="_blank" rel="noopener noreferrer">View your support ticket</a>';
     foreach(['{{ticket.url}}','{ticket.url}','{ticket_url}'] as $token){$body=str_replace($token,$link,$body);$subject=str_replace($token,$ticketUrl,$subject);}
     $color=setting('brand_color','#12377b');if(!preg_match('/^#[0-9a-fA-F]{6}$/',$color))$color='#12377b';$logo=setting('brand_logo',''); if($logo!=='' && !preg_match('#^https?://#i',$logo)) $logo=app_url($logo);
@@ -205,7 +295,41 @@ function notify_event(string $event, array $ticket, string $message=''): void {
         foreach(array_unique($emails) as $email) mail_send($email,$subject,$body);
     }
 }
-function app_url(string $path): string { global $config; if(!empty($config['base_url'])) return rtrim($config['base_url'],'/').'/'.ltrim($path,'/'); $scheme=(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')?'https':'http'; return $scheme.'://'.($_SERVER['HTTP_HOST']??'localhost').rtrim(dirname($_SERVER['SCRIPT_NAME']??'/'),'/').'/'.$path; }
-function audit(string $action, string $details=''): void { $u=current_user(); $q=db()->prepare('INSERT INTO audit_logs(user_id,action,details,ip,created_at) VALUES(?,?,?,?,?)'); $q->execute([$u['id']??null,$action,$details,$_SERVER['REMOTE_ADDR']??'',date('c')]); }
+function request_host(): string {
+    $h=(string)($_SERVER['HTTP_HOST']??'');
+    if($h!=='' && preg_match('/^(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$/',$h)) return $h;
+    $n=(string)($_SERVER['SERVER_NAME']??'localhost'); return preg_match('/^[A-Za-z0-9.\-]+$/',$n)?$n:'localhost';
+}
+function base_url_configured(): bool { global $config; return trim((string)($config['base_url']??''))!==''; }
+function app_url(string $path): string {
+    global $config;
+    if(base_url_configured()) return rtrim((string)$config['base_url'],'/').'/'.ltrim($path,'/');
+    $scheme=(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off')?'https':'http';
+    return $scheme.'://'.request_host().rtrim(dirname($_SERVER['SCRIPT_NAME']??'/'),'/').'/'.ltrim($path,'/');
+}
+function client_ip(): string {
+    global $config; $ip=(string)($_SERVER['REMOTE_ADDR']??''); $hdr=trim((string)($config['trusted_proxy_header']??''));
+    if($hdr!=='' && !empty($_SERVER[$hdr])) { $first=trim(explode(',',(string)$_SERVER[$hdr])[0]); if(filter_var($first,FILTER_VALIDATE_IP)) $ip=$first; }
+    return $ip;
+}
+function rate_limit_count(string $bucket,string $key,int $window): int { $q=db()->prepare('SELECT COUNT(*) FROM rate_limits WHERE bucket=? AND rkey=? AND created_at>?'); $q->execute([$bucket,$key,time()-$window]); return (int)$q->fetchColumn(); }
+function rate_limit_hit(string $bucket,string $key): void {
+    db()->prepare('INSERT INTO rate_limits(bucket,rkey,created_at) VALUES(?,?,?)')->execute([$bucket,$key,time()]);
+    if(random_int(1,50)===1) db()->prepare('DELETE FROM rate_limits WHERE created_at<?')->execute([time()-172800]);
+}
+function rate_limit_clear(string $bucket,string $key): void { db()->prepare('DELETE FROM rate_limits WHERE bucket=? AND rkey=?')->execute([$bucket,$key]); }
+/** @return array{0:int,1:int} [max failed attempts, lockout window in seconds] */
+function login_limits(): array { return [max(3,min(20,(int)setting('login_max_attempts','5'))), max(1,min(240,(int)setting('login_lockout_minutes','15')))*60]; }
+function db_relative_url(): string {
+    global $config; $root=realpath(dirname(__DIR__)); $db=realpath((string)($config['database']??'')); if(!$root||!$db) return '';
+    $root=rtrim($root,DIRECTORY_SEPARATOR).DIRECTORY_SEPARATOR; if(strncmp($db,$root,strlen($root))!==0) return '';
+    return str_replace(DIRECTORY_SEPARATOR,'/',substr($db,strlen($root)));
+}
+function auth_brand_mark(): string {
+    $app=setting('app_name','HelpDesk'); $logo=setting('brand_logo','');
+    $mark=$logo!==''?'<img class="auth-logo" src="'.h($logo).'" alt="'.h($app).'">':'<div class="brand-mark large">'.h(strtoupper(substr($app,0,1))).'</div>';
+    return '<div class="auth-brand">'.$mark.'<div class="auth-appname">'.h($app).'</div></div>';
+}
+function audit(string $action, string $details=''): void { $u=current_user(); $q=db()->prepare('INSERT INTO audit_logs(user_id,action,details,ip,created_at) VALUES(?,?,?,?,?)'); $q->execute([$u['id']??null,$action,$details,client_ip(),date('c')]); }
 function ticket_by_id(int $id): ?array { $q=db()->prepare('SELECT t.*,COALESCE(t.guest_name,u.name) user_name,COALESCE(t.guest_email,u.email) user_email,COALESCE(t.guest_phone,u.phone) user_phone,COALESCE(t.guest_company,u.company) user_company,COALESCE(t.guest_department,u.department) user_department,g.name group_name,au.name assigned_name,st.name status_name,p.name priority_name FROM tickets t LEFT JOIN users u ON u.id=t.user_id LEFT JOIN groups g ON g.id=t.group_id LEFT JOIN users au ON au.id=t.assigned_user_id JOIN statuses st ON st.id=t.status_id JOIN priorities p ON p.id=t.priority_id WHERE t.id=?'); $q->execute([$id]); return $q->fetch()?:null; }
 

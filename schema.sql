@@ -10,7 +10,7 @@ CREATE TABLE group_roles(group_id INTEGER NOT NULL REFERENCES groups(id) ON DELE
 CREATE TABLE user_groups(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,PRIMARY KEY(user_id,group_id));
 CREATE TABLE categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,active INTEGER NOT NULL DEFAULT 1);
 INSERT INTO categories(name) VALUES('Hardware'),('Software'),('Network'),('Accounts & access'),('Other');
-CREATE TABLE statuses(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL); INSERT INTO statuses(name) VALUES('Open'),('In Progress'),('Waiting on User'),('Resolved'),('Closed');
+CREATE TABLE statuses(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,active INTEGER NOT NULL DEFAULT 1); INSERT INTO statuses(name) VALUES('Open'),('In Progress'),('Waiting on User'),('Resolved'),('Closed');
 CREATE TABLE priorities(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,level INTEGER NOT NULL); INSERT INTO priorities(name,level) VALUES('Low',1),('Normal',2),('High',3),('Critical',4);
 CREATE TABLE tickets(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_no TEXT UNIQUE NOT NULL,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,subject TEXT NOT NULL,description TEXT NOT NULL,category_id INTEGER REFERENCES categories(id),priority_id INTEGER NOT NULL REFERENCES priorities(id),status_id INTEGER NOT NULL REFERENCES statuses(id),group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,assigned_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,resolved_at TEXT,guest_name TEXT,guest_email TEXT,guest_phone TEXT,guest_company TEXT,guest_department TEXT);
 CREATE TABLE ticket_comments(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,body TEXT NOT NULL,is_internal INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
@@ -21,3 +21,8 @@ CREATE TABLE audit_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER REF
 CREATE INDEX idx_tickets_status ON tickets(status_id); CREATE INDEX idx_tickets_user ON tickets(user_id); CREATE INDEX idx_tickets_updated ON tickets(updated_at);
 
 CREATE INDEX idx_user_roles_role ON user_roles(role_id);
+CREATE TABLE ticket_history(id INTEGER PRIMARY KEY AUTOINCREMENT,ticket_id INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,action TEXT NOT NULL,details TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
+CREATE TABLE otp_challenges(id TEXT PRIMARY KEY,email TEXT NOT NULL,purpose TEXT NOT NULL,code_hash TEXT NOT NULL,payload TEXT,session_hash TEXT NOT NULL,expires_at INTEGER NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL);
+CREATE INDEX idx_otp_email_purpose ON otp_challenges(email,purpose,created_at);
+CREATE TABLE rate_limits(id INTEGER PRIMARY KEY AUTOINCREMENT,bucket TEXT NOT NULL,rkey TEXT NOT NULL,created_at INTEGER NOT NULL);
+CREATE INDEX idx_rate_limits_lookup ON rate_limits(bucket,rkey,created_at);
